@@ -27,7 +27,7 @@ def init_model():
     models = [m.name for m in genai.list_models()
               if 'generateContent' in m.supported_generation_methods]
     name = next((m for m in models if "1.5-flash" in m), models[0])
-    st.sidebar.caption(f"🤖 AI 모델: `{name}`")  # 현재 연결된 모델 표시
+    st.sidebar.caption(f"🤖 AI 모델: `{name}`")
     return genai.GenerativeModel(name)
 
 try:
@@ -41,14 +41,12 @@ except Exception as e:
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def init_gspread():
-    """service_account 방식으로 gspread 클라이언트 초기화"""
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
     info = dict(st.secrets["gcp_service_account"])
     info["private_key"] = info["private_key"].replace("\\n", "\n")
-
     try:
         creds = Credentials.from_service_account_info(info, scopes=scope)
         return gspread.authorize(creds)
@@ -267,30 +265,24 @@ JSON 외 어떤 텍스트도 출력하지 마세요.
     return fallback_file, fallback_tab
 
 # ─────────────────────────────────────────────────────────────
-# 10. 전처리 ← 이슈 B 수정 핵심 부분
+# 10. 전처리
 # ─────────────────────────────────────────────────────────────
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # ✅ 이슈 B 수정: errors="ignore" → errors="coerce" + 콤마 제거
     for col in df.columns:
         if col not in ("SIDO", "SIGU"):
             cleaned   = df[col].astype(str).str.replace(",", "", regex=False)
             converted = pd.to_numeric(cleaned, errors="coerce")
             if converted.notna().any():
                 df[col] = converted
-            # 전부 NaN이면 원본 유지 (문자열 컬럼 보호)
-
     if "SIDO" in df.columns and sido_sel != "전체":
         df = df[df["SIDO"].astype(str).str.contains(sido_sel, na=False)]
     if "SIGU" in df.columns and sigu_sel != "전체":
         df = df[df["SIGU"].astype(str).str.contains(sigu_sel, na=False)]
-
     sort_col = next((c for c in ["ZONE", "ORGN"] if c in df.columns), None)
     if sort_col:
         df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
         df = df.sort_values(sort_col).dropna(subset=[sort_col])
-
     df.rename(columns={c: COL_KR.get(c, c) for c in df.columns}, inplace=True)
     return df
 
@@ -342,24 +334,63 @@ def load_integrated(file_label: str, tab: str,
     return df, interp
 
 # ─────────────────────────────────────────────────────────────
-# 13. AI 분석 프롬프트 규칙
+# 13. 질문 의도 분석 — 집계 필요 여부 판단
+# ─────────────────────────────────────────────────────────────
+def needs_aggregation(query: str) -> str:
+    """
+    질문을 보고 어떤 단위로 집계할지 반환
+    'sido'  → 시도별 합산
+    'sigu'  → 시군구별 합산
+    'zone'  → 존 단위 그대로 (집계 없음)
+    """
+    sido_keywords = ["시도별", "시도 별", "광역시", "도별", "전국 시도", "시도 합계", "시도 인구"]
+    sigu_keywords = ["시군구별", "시군구 별", "구별", "군별", "시별"]
+
+    if any(k in query for k in sido_keywords):
+        return "sido"
+    elif any(k in query for k in sigu_keywords):
+        return "sigu"
+    else:
+        return "zone"
+
+# ─────────────────────────────────────────────────────────────
+# 14. 집계 함수 — pandas가 직접 계산
+# ─────────────────────────────────────────────────────────────
+def aggregate_df(df: pd.DataFrame, agg_level: str) -> pd.DataFrame:
+    """코드(pandas)가 직접 집계 — AI에게 계산 맡기지 않음"""
+    num_cols = [c for c in df.columns if c not in ("시도", "시군구", "존번호")]
+
+    if agg_level == "sido" and "시도" in df.columns:
+        return df.groupby("시도")[num_cols].sum().reset_index()
+
+    elif agg_level == "sigu" and "시군구" in df.columns:
+        group_cols = [c for c in ["시도", "시군구"] if c in df.columns]
+        return df.groupby(group_cols)[num_cols].sum().reset_index()
+
+    else:
+        # 존 단위 — 집계 없이 그대로
+        return df
+
+# ─────────────────────────────────────────────────────────────
+# 15. AI 분석 프롬프트 규칙
 # ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """당신은 KTDB 전문 분석가입니다. 아래 규칙을 엄격히 따르세요.
 
 [출력 규칙]
 1. 설명은 2~3줄 이내 핵심 요약만 작성.
 2. 표 헤더는 한글 공식 용어 사용(시도, 시군구, 존번호, 총 인구수, 출근, 승용차 등).
-3. 표는 존번호(또는 발생존) 오름차순 정렬.
+3. 표는 존번호(또는 발생존) 오름차순 정렬. 시도별 집계 시 시도명 가나다순.
 4. 단위를 표 상단이나 헤더에 반드시 표기.
 5. 보간 연도가 있으면 해당 열 헤더에 *(보간) 주석 추가.
 6. 행정구역(시도·시군구·존번호) 컬럼은 고정, 나머지는 질문에 따라 구성.
 7. 연도별 비교: 상위 헤더=항목명, 하위 헤더=연도 / 항목별 비교: 상위 헤더=연도, 하위 헤더=항목명.
-8. 실제 데이터에 없는 수치를 절대 만들어내지 마세요.
-9. 출력 형식: 요약 텍스트 → CSV 블록(```csv ... ```) 순.
+8. ⚠️ 제공된 숫자를 절대 수정·재계산·반올림하지 마세요. 받은 숫자를 그대로 표에 옮기세요.
+9. 실제 데이터에 없는 수치를 절대 만들어내지 마세요.
+10. 출력 형식: 요약 텍스트 → CSV 블록(```csv ... ```) 순.
 """
 
 # ─────────────────────────────────────────────────────────────
-# 14. 기존 대화 렌더링
+# 16. 기존 대화 렌더링
 # ─────────────────────────────────────────────────────────────
 st.title("🚦 KTDB 통합 분석 에이전트")
 
@@ -384,9 +415,9 @@ if any("df" in m for m in st.session_state.messages):
     )
 
 # ─────────────────────────────────────────────────────────────
-# 15. 질문 처리
+# 17. 질문 처리
 # ─────────────────────────────────────────────────────────────
-if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 2030년 인구수와 종사자수 비교"):
+if user_input := st.chat_input("질문을 입력하세요 — 예: 시도별 2023년 인구수 비교"):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
@@ -421,23 +452,34 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 203
                 st.error(f"❌ 데이터 로드 실패: {e}")
                 st.stop()
 
+        # ④ 집계 — pandas가 직접 계산 (AI에게 맡기지 않음)
+        agg_level = needs_aggregation(user_input)
+        if ai_file == "사회경제지표":
+            agg_df = aggregate_df(df, agg_level)
+            agg_note = {"sido": "시도별 합산", "sigu": "시군구별 합산", "zone": "존 단위"}.get(agg_level, "")
+        else:
+            agg_df   = df      # OD 데이터는 집계 없이 그대로
+            agg_note = ""
+
         unit        = UNITS.get(ai_file, "")
         interp_note = (
             f"\n※ 보간 연도: {interp_years} (선형보간법 적용)"
             if interp_years else ""
         )
 
-        # ④ AI 분석
-        data_sample = df.head(150).to_string(index=False)
+        # ⑤ AI에게는 집계 완료된 숫자만 전달
+        data_sample = agg_df.to_string(index=False)
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
-            f"[데이터 정보]\n"
-            f"파일: {ai_file} / 시트: {tab_kr} / 단위: {unit}{interp_note}\n"
-            f"컬럼: {list(df.columns)}\n"
-            f"데이터(최대 150행):\n{data_sample}\n\n"
+            f"[집계 완료 데이터 — 숫자를 절대 수정하거나 재계산하지 마세요]\n"
+            f"파일: {ai_file} / 시트: {tab_kr} / 단위: {unit}"
+            f"{f' / 집계: {agg_note}' if agg_note else ''}{interp_note}\n"
+            f"컬럼: {list(agg_df.columns)}\n"
+            f"아래 숫자를 그대로 표로 옮기고 요약 텍스트만 작성하세요:\n{data_sample}\n\n"
             f"[질문]\n{user_input}"
         )
 
+        # ⑥ AI 분석
         with st.spinner("보고서 작성 중..."):
             response = model.generate_content(prompt)
 
