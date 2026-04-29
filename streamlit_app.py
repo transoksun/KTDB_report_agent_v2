@@ -24,9 +24,22 @@ thead tr th { background: #f0f2f6; font-weight: 600; }
 @st.cache_resource
 def init_model():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    models = [m.name for m in genai.list_models()
-              if 'generateContent' in m.supported_generation_methods]
-    name = next((m for m in models if "1.5-flash" in m), models[0])
+    models = [
+        m.name for m in genai.list_models()
+        if 'generateContent' in m.supported_generation_methods
+    ]
+    
+    # 우선순위 순서로 모델 탐색
+    preferred = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    name = None
+    for pref in preferred:
+        found = next((m for m in models if pref in m), None)
+        if found:
+            name = found
+            break
+    if not name:
+        name = models[0]  # 그래도 없으면 첫 번째
+
     st.sidebar.caption(f"🤖 AI 모델: `{name}`")
     return genai.GenerativeModel(name)
 
