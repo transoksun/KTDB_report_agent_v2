@@ -19,19 +19,20 @@ thead tr th { background: #f0f2f6; font-weight: 600; }
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# 2. AI 모델 초기화
+# 2. AI 모델 초기화 ← 수정된 부분
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def init_model():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    
-    # 사용 가능한 모델 목록 확인 (디버깅용)
+
     available = [m.name for m in genai.list_models()
                  if 'generateContent' in m.supported_generation_methods]
-    st.sidebar.caption(f"🤖 사용 가능 모델: {available[:3]}")  # 처음 3개만 표시
-    
-    # 직접 지정 (우선순위 순)
+    st.sidebar.caption(f"🤖 사용 가능 모델: {available[:3]}")
+
+    # ★ 우선순위 수정 — 2.5-flash 최우선
     for candidate in [
+        "models/gemini-2.5-flash",
+        "models/gemini-2.5-pro",
         "models/gemini-2.0-flash",
         "models/gemini-1.5-flash",
         "models/gemini-1.5-flash-latest",
@@ -40,8 +41,7 @@ def init_model():
         if candidate in available:
             st.sidebar.caption(f"✅ 선택된 모델: `{candidate}`")
             return genai.GenerativeModel(candidate)
-    
-    # 위에 없으면 목록 첫 번째 사용
+
     st.sidebar.caption(f"✅ 선택된 모델: `{available[0]}`")
     return genai.GenerativeModel(available[0])
 
@@ -139,17 +139,10 @@ def load_sheet(spreadsheet_url: str, tab_name: str) -> pd.DataFrame:
     return df
 
 # ─────────────────────────────────────────────────────────────
-# 6. ★ ZONE 기준표 로드 (모든 정렬의 기준)
-#    ZONE 시트: 존번호 → 시도, 시군구 매핑
-#    이 순서가 모든 데이터의 정렬 기준이 됨
+# 6. ZONE 기준표 로드
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def load_zone_master() -> pd.DataFrame:
-    """
-    ZONE 시트를 로드해서 기준표로 반환
-    컬럼: ZONE(존번호), SIDO(시도), SIGU(시군구)
-    존번호 오름차순으로 정렬 — 이게 모든 결과의 정렬 기준
-    """
     try:
         url = st.secrets["SHEET_URL_SOCIO"]
         df  = load_sheet(url, "ZONE")
@@ -162,7 +155,7 @@ def load_zone_master() -> pd.DataFrame:
         return pd.DataFrame(columns=["ZONE", "SIDO", "SIGU"])
 
 # ─────────────────────────────────────────────────────────────
-# 7. 시군구 목록 동적 로드 (ZONE 기준표 활용)
+# 7. 시군구 목록 동적 로드
 # ─────────────────────────────────────────────────────────────
 SIDO_LIST = [
     "전체", "서울특별시", "부산광역시", "대구광역시", "인천광역시",
@@ -179,7 +172,6 @@ def get_sigu_list(sido: str) -> list:
             zone_master = zone_master[
                 zone_master["SIDO"].astype(str).str.contains(sido, na=False)
             ]
-        # ★ 존번호 순서 그대로 시군구 목록 생성 (가나다순 아님)
         sigu_list = zone_master["SIGU"].dropna().unique().tolist()
         return ["전체"] + sigu_list
     except Exception:
@@ -310,28 +302,20 @@ JSON 외 어떤 텍스트도 출력하지 마세요.
 # ─────────────────────────────────────────────────────────────
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # 숫자형 변환 (콤마 제거 포함)
     for col in df.columns:
         if col not in ("SIDO", "SIGU"):
             cleaned   = df[col].astype(str).str.replace(",", "", regex=False)
             converted = pd.to_numeric(cleaned, errors="coerce")
             if converted.notna().any():
                 df[col] = converted
-
-    # 지역 필터
     if "SIDO" in df.columns and sido_sel != "전체":
         df = df[df["SIDO"].astype(str).str.contains(sido_sel, na=False)]
     if "SIGU" in df.columns and sigu_sel != "전체":
         df = df[df["SIGU"].astype(str).str.contains(sigu_sel, na=False)]
-
-    # ★ 존번호(ZONE) 또는 발생존(ORGN) 기준 오름차순 정렬
     sort_col = next((c for c in ["ZONE", "ORGN"] if c in df.columns), None)
     if sort_col:
         df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
         df = df.sort_values(sort_col, ascending=True).dropna(subset=[sort_col])
-
-    # 컬럼 한글화
     df.rename(columns={c: COL_KR.get(c, c) for c in df.columns}, inplace=True)
     return df
 
@@ -383,7 +367,7 @@ def load_integrated(file_label: str, tab: str,
     return df, interp
 
 # ─────────────────────────────────────────────────────────────
-# 14. 질문 의도 분석 — 집계 단위 판단
+# 14. 질문 의도 분석
 # ─────────────────────────────────────────────────────────────
 def needs_aggregation(query: str) -> str:
     sido_keywords = ["시도별", "시도 별", "광역시", "도별", "전국 시도", "시도 합계", "시도 인구"]
@@ -396,21 +380,17 @@ def needs_aggregation(query: str) -> str:
         return "zone"
 
 # ─────────────────────────────────────────────────────────────
-# 15. ★ 집계 함수 — ZONE 기준표 순서로 정렬
-#    집계 후 존번호가 사라져도 ZONE 시트의 시도/시군구 등장 순서를 따름
+# 15. 집계 함수
 # ─────────────────────────────────────────────────────────────
 def aggregate_df(df: pd.DataFrame, agg_level: str) -> pd.DataFrame:
-    zone_master = load_zone_master()  # ZONE 기준표 (존번호 오름차순)
+    zone_master = load_zone_master()
     num_cols    = [c for c in df.columns if c not in ("시도", "시군구", "존번호")]
 
     if agg_level == "sido" and "시도" in df.columns:
-        # pandas로 시도별 합산
         result = df.groupby("시도")[num_cols].sum().reset_index()
-
-        # ★ ZONE 기준표에서 시도별 첫 번째 존번호를 추출 → 그 순서로 정렬
         sido_order = (
             zone_master.rename(columns={"SIDO": "시도"})
-            .drop_duplicates(subset="시도", keep="first")  # 시도별 첫 존번호
+            .drop_duplicates(subset="시도", keep="first")
             [["시도", "ZONE"]]
         )
         result = result.merge(sido_order, on="시도", how="left")
@@ -418,11 +398,8 @@ def aggregate_df(df: pd.DataFrame, agg_level: str) -> pd.DataFrame:
         return result.reset_index(drop=True)
 
     elif agg_level == "sigu" and "시군구" in df.columns:
-        # pandas로 시군구별 합산
         group_cols = [c for c in ["시도", "시군구"] if c in df.columns]
         result = df.groupby(group_cols)[num_cols].sum().reset_index()
-
-        # ★ ZONE 기준표에서 시군구별 첫 번째 존번호를 추출 → 그 순서로 정렬
         sigu_order = (
             zone_master.rename(columns={"SIDO": "시도", "SIGU": "시군구"})
             .drop_duplicates(subset="시군구", keep="first")
@@ -433,7 +410,6 @@ def aggregate_df(df: pd.DataFrame, agg_level: str) -> pd.DataFrame:
         return result.reset_index(drop=True)
 
     else:
-        # 존 단위 — 존번호 오름차순 (preprocess에서 이미 정렬됨)
         return df
 
 # ─────────────────────────────────────────────────────────────
@@ -517,13 +493,12 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 시도별 202
                 st.error(f"❌ 데이터 로드 실패: {e}")
                 st.stop()
 
-        # ④ 집계 — pandas가 직접 계산, ZONE 기준표 순서로 정렬
+        # ④ 집계
         agg_level = needs_aggregation(user_input)
         if ai_file == "사회경제지표":
             agg_df   = aggregate_df(df, agg_level)
             agg_note = {"sido": "시도별 합산", "sigu": "시군구별 합산", "zone": "존 단위"}.get(agg_level, "")
         else:
-            # OD 데이터 — 발생존(ORGN) 기준 존번호 순서 유지
             if "발생존" in df.columns:
                 df = df.sort_values("발생존", ascending=True).reset_index(drop=True)
             agg_df   = df
@@ -535,7 +510,7 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 시도별 202
             if interp_years else ""
         )
 
-        # ⑤ AI에게 집계·정렬 완료된 데이터 전달
+        # ⑤ AI에게 전달
         data_sample = agg_df.to_string(index=False)
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
@@ -560,17 +535,14 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 시도별 202
         if "```csv" in full_text:
             csv_raw = full_text.split("```csv")[1].split("```")[0].strip()
             try:
-                res_df = pd.read_csv(io.StringIO(csv_raw))
-
-                # ★ CSV 파싱 후 ZONE 기준표 순서로 재정렬 (AI가 순서 바꿨을 경우 대비)
+                res_df      = pd.read_csv(io.StringIO(csv_raw))
                 zone_master = load_zone_master()
+
                 if "존번호" in res_df.columns:
-                    # 존 단위: 존번호 오름차순
                     res_df["존번호"] = pd.to_numeric(res_df["존번호"], errors="coerce")
                     res_df = res_df.sort_values("존번호", ascending=True).reset_index(drop=True)
 
                 elif "시도" in res_df.columns and "시군구" not in res_df.columns:
-                    # 시도 집계: ZONE 기준표의 시도 첫 등장 순서
                     sido_order = (
                         zone_master.rename(columns={"SIDO": "시도"})
                         .drop_duplicates(subset="시도", keep="first")
@@ -581,7 +553,6 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 시도별 202
                     res_df = res_df.reset_index(drop=True)
 
                 elif "시군구" in res_df.columns:
-                    # 시군구 집계: ZONE 기준표의 시군구 첫 등장 순서
                     sigu_order = (
                         zone_master.rename(columns={"SIGU": "시군구"})
                         .drop_duplicates(subset="시군구", keep="first")
@@ -592,7 +563,6 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 시도별 202
                     res_df = res_df.reset_index(drop=True)
 
                 elif "발생존" in res_df.columns:
-                    # OD 데이터: 발생존 오름차순
                     res_df["발생존"] = pd.to_numeric(res_df["발생존"], errors="coerce")
                     res_df = res_df.sort_values("발생존", ascending=True).reset_index(drop=True)
 
