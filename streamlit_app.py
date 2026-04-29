@@ -511,12 +511,14 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 시도별 202
         )
 
         # ⑤ AI에게 전달
-        data_sample = agg_df.to_string(index=False)
+        data_sample = agg_df.head(200).to_string(index=False)
+        total_rows  = len(agg_df)
+        row_note    = f"\n※ 전체 {total_rows}행 중 200행만 표시" if total_rows > 200 else ""
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"[집계·정렬 완료 데이터 — 숫자와 순서를 절대 바꾸지 마세요]\n"
             f"파일: {ai_file} / 시트: {tab_kr} / 단위: {unit}"
-            f"{f' / 집계: {agg_note}' if agg_note else ''}{interp_note}\n"
+            f"{f' / 집계: {agg_note}' if agg_note else ''}{interp_note}{row_note}\n"
             f"컬럼: {list(agg_df.columns)}\n"
             f"아래 데이터를 순서 그대로 표로 옮기고 요약 텍스트만 작성하세요:\n{data_sample}\n\n"
             f"[질문]\n{user_input}"
