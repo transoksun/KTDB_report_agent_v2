@@ -24,24 +24,26 @@ thead tr th { background: #f0f2f6; font-weight: 600; }
 @st.cache_resource
 def init_model():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    models = [
-        m.name for m in genai.list_models()
-        if 'generateContent' in m.supported_generation_methods
-    ]
     
-    # 우선순위 순서로 모델 탐색
-    preferred = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
-    name = None
-    for pref in preferred:
-        found = next((m for m in models if pref in m), None)
-        if found:
-            name = found
-            break
-    if not name:
-        name = models[0]  # 그래도 없으면 첫 번째
-
-    st.sidebar.caption(f"🤖 AI 모델: `{name}`")
-    return genai.GenerativeModel(name)
+    # 사용 가능한 모델 목록 확인 (디버깅용)
+    available = [m.name for m in genai.list_models()
+                 if 'generateContent' in m.supported_generation_methods]
+    st.sidebar.caption(f"🤖 사용 가능 모델: {available[:3]}")  # 처음 3개만 표시
+    
+    # 직접 지정 (우선순위 순)
+    for candidate in [
+        "models/gemini-2.0-flash",
+        "models/gemini-1.5-flash",
+        "models/gemini-1.5-flash-latest",
+        "models/gemini-pro",
+    ]:
+        if candidate in available:
+            st.sidebar.caption(f"✅ 선택된 모델: `{candidate}`")
+            return genai.GenerativeModel(candidate)
+    
+    # 위에 없으면 목록 첫 번째 사용
+    st.sidebar.caption(f"✅ 선택된 모델: `{available[0]}`")
+    return genai.GenerativeModel(available[0])
 
 try:
     model = init_model()
